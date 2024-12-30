@@ -15,7 +15,6 @@ from scrapy.linkextractors import LinkExtractor
 from scrapy.crawler import CrawlerProcess
 from scrapy.exceptions import DropItem
 from scrapy import signals
-from sentence_transformers import SentenceTransformer
 import pytz
 
 # Load environment variables
@@ -93,10 +92,21 @@ class MongoDBPipeline:
         self.enable_embeddings = enable_embeddings
         self.model = None
 
-        # Only initialize the model if embeddings are enabled
+        # Only import and initialize the model if embeddings are enabled
         if self.enable_embeddings:
-            self.model = SentenceTransformer("djovak/embedic-large")
-            logger.info("Initialized embedding model")
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                self.model = SentenceTransformer("djovak/embedic-large")
+                logger.info("Initialized embedding model")
+            except ImportError:
+                logger.error(
+                    "Failed to import SentenceTransformer. Is the package installed?"
+                )
+                raise
+            except Exception as e:
+                logger.error(f"Error initializing model: {str(e)}")
+                raise
 
     @classmethod
     def from_crawler(cls, crawler):
