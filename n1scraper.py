@@ -12,6 +12,7 @@ import logging
 import pymongo
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
+import argparse
 
 # Load environment variables
 load_dotenv()
@@ -22,8 +23,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize embedding model
-model = SentenceTransformer("djovak/embedic-large")
+# Model will be initialized only if embeddings are enabled
+model = None
 
 
 def get_random_headers():
@@ -108,12 +109,6 @@ def clean_text(text):
 def extract_entry_content(url):
     """
     Extract content from a div with class 'entry-content' using BeautifulSoup with UTF-8 encoding.
-
-    Args:
-        url (str): URL of the webpage
-
-    Returns:
-        dict: Contains both HTML and text content of the entry-content div
     """
     try:
         # Fetch the webpage with explicit encoding
@@ -153,14 +148,11 @@ def extract_entry_content(url):
             date_str = date.get_text().strip() if date else None
             if date_str:
                 try:
-                    # Using dateutil.parser for flexible date parsing
                     parsed_date = dateutil_parse(date_str)
-                    # If date has no timezone, assume Serbian time
                     if parsed_date.tzinfo is None:
                         parsed_date = pytz.timezone("Europe/Belgrade").localize(
                             parsed_date
                         )
-                    # Convert to UTC for MongoDB
                     mongodb_date = parsed_date.astimezone(pytz.UTC)
                 except Exception as e:
                     logger.error(f"Error parsing date {date_str}: {e}")
@@ -187,13 +179,20 @@ def extract_entry_content(url):
 
 
 class MongoDBHandler:
-    def __init__(self):
+    def __init__(self, enable_embeddings=False):
         self.mongo_uri = os.getenv("MONGODB_URI")
         self.db_name = os.getenv("DB_NAME")
         self.collection_name = os.getenv("COLLECTION_NAME")
         self.client = None
         self.db = None
         self.collection = None
+        self.enable_embeddings = enable_embeddings
+
+        # Only initialize the model if embeddings are enabled
+        global model
+        if self.enable_embeddings and model is None:
+            model = SentenceTransformer("djovak/embedic-large")
+            logger.info("Initialized embedding model")
 
     def connect(self):
         try:
@@ -233,14 +232,17 @@ class MongoDBHandler:
             # Add timestamp
             article["scraped_at"] = datetime.utcnow()
 
-            # Generate embedding
-            try:
-                text_for_embedding = f"{article['title']} {article['content']}"
-                embedding = model.encode(text_for_embedding)
-                article["embedding"] = embedding.tolist()
-                logger.info(f"Generated embedding for article: {article['title']}")
-            except Exception as e:
-                logger.error(f"Error generating embedding: {str(e)}")
+            # Generate embedding only if enabled and model is loaded
+            if self.enable_embeddings and model is not None:
+                try:
+                    text_for_embedding = f"{article['title']} {article['content']}"
+                    embedding = model.encode(text_for_embedding)
+                    article["embedding"] = embedding.tolist()
+                    logger.info(f"Generated embedding for article: {article['title']}")
+                except Exception as e:
+                    logger.error(f"Error generating embedding: {str(e)}")
+                    article["embedding"] = None
+            else:
                 article["embedding"] = None
 
             # Save to MongoDB
@@ -263,6 +265,16 @@ class MongoDBHandler:
 
 def main():
     try:
+        # Add argument parsing
+        parser = argparse.ArgumentParser(description="Run the N1 scraper")
+        parser.add_argument(
+            "--embeddings",
+            action="store_true",
+            default=False,
+            help="Enable embeddings generation (default: False)",
+        )
+        args = parser.parse_args()
+
         # Verify environment variables
         required_vars = ["MONGODB_URI", "DB_NAME", "COLLECTION_NAME"]
         missing_vars = [var for var in required_vars if not os.getenv(var)]
@@ -271,9 +283,13 @@ def main():
                 f"Missing required environment variables: {', '.join(missing_vars)}"
             )
 
-        # Initialize MongoDB
-        mongodb = MongoDBHandler()
+        # Initialize MongoDB with embeddings flag
+        mongodb = MongoDBHandler(enable_embeddings=args.embeddings)
         mongodb.connect()
+
+        logger.info(
+            f"Starting scraper with embeddings {'enabled' if args.embeddings else 'disabled'}..."
+        )
 
         # Process pages one by one
         page = 1

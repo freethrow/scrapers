@@ -5,6 +5,7 @@ import os
 from functools import wraps
 import time
 from dotenv import load_dotenv
+import argparse
 
 import pymongo
 from pymongo import MongoClient
@@ -19,9 +20,6 @@ import pytz
 
 # Load environment variables
 load_dotenv()
-
-# Initialize the embedding model
-model = SentenceTransformer("djovak/embedic-large")
 
 # Configure logging
 logging.basicConfig(
@@ -52,20 +50,59 @@ def retry_with_backoff(retries=3, backoff_in_seconds=1):
     return decorator
 
 
+class RandomUserAgentMiddleware:
+    """Middleware to rotate User-Agents for each request."""
+
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    ]
+
+    def __init__(self):
+        self.user_agents = self.user_agents
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        middleware = cls()
+        crawler.signals.connect(middleware.spider_opened, signal=signals.spider_opened)
+        return middleware
+
+    def process_request(self, request, spider):
+        user_agent = random.choice(self.user_agents)
+        request.headers["User-Agent"] = user_agent
+        return None
+
+    def spider_opened(self, spider):
+        spider.logger.info("Spider opened: %s" % spider.name)
+
+
 class MongoDBPipeline:
     """Pipeline for storing scraped items in MongoDB."""
 
-    def __init__(self):
+    def __init__(self, enable_embeddings=False):
         self.mongo_uri = os.getenv("MONGODB_URI")
         self.db_name = os.getenv("DB_NAME")
         self.collection_name = os.getenv("COLLECTION_NAME")
         self.client = None
         self.db = None
         self.collection = None
+        self.enable_embeddings = enable_embeddings
+        self.model = None
+
+        # Only initialize the model if embeddings are enabled
+        if self.enable_embeddings:
+            self.model = SentenceTransformer("djovak/embedic-large")
+            logger.info("Initialized embedding model")
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls()
+        # Get the embeddings setting from crawler settings
+        enable_embeddings = crawler.settings.get("ENABLE_EMBEDDINGS", False)
+        return cls(enable_embeddings=enable_embeddings)
 
     def open_spider(self, spider):
         """Initialize MongoDB connection when spider opens."""
@@ -107,17 +144,17 @@ class MongoDBPipeline:
             # Add timestamp
             item["scraped_at"] = datetime.utcnow()
 
-            # Generate embedding
-            try:
-                text_for_embedding = f"{item['title']} {item['content']}"
-                embedding = model.encode(text_for_embedding)
-
-                # Convert numpy array to list for MongoDB storage
-                item["embedding"] = embedding.tolist()
-                logger.info(f"Generated embedding for article: {item['title']}")
-
-            except Exception as e:
-                logger.error(f"Error generating embedding: {str(e)}")
+            # Generate embedding only if enabled
+            if self.enable_embeddings and self.model:
+                try:
+                    text_for_embedding = f"{item['title']} {item['content']}"
+                    embedding = self.model.encode(text_for_embedding)
+                    item["embedding"] = embedding.tolist()
+                    logger.info(f"Generated embedding for article: {item['title']}")
+                except Exception as e:
+                    logger.error(f"Error generating embedding: {str(e)}")
+                    item["embedding"] = None
+            else:
                 item["embedding"] = None
 
             # Insert the item
@@ -132,36 +169,6 @@ class MongoDBPipeline:
         except Exception as e:
             logger.error(f"Error saving article to MongoDB: {str(e)}")
             raise
-
-
-class RandomUserAgentMiddleware:
-    """Middleware to rotate User-Agents for each request."""
-
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    ]
-
-    def __init__(self):
-        self.user_agents = self.user_agents
-
-    @classmethod
-    def from_crawler(cls, crawler):
-        middleware = cls()
-        crawler.signals.connect(middleware.spider_opened, signal=signals.spider_opened)
-        return middleware
-
-    def process_request(self, request, spider):
-        user_agent = random.choice(self.user_agents)
-        request.headers["User-Agent"] = user_agent
-        return None
-
-    def spider_opened(self, spider):
-        spider.logger.info("Spider opened: %s" % spider.name)
 
 
 class DanasSpider(CrawlSpider):
@@ -302,33 +309,6 @@ class DanasSpider(CrawlSpider):
             logger.error(f"Error parsing article {response.url}: {str(e)}")
             return None
 
-            content = "".join(
-                [
-                    p.strip()
-                    .replace('"', "")
-                    .replace("'", "")
-                    .replace('"', "")
-                    .replace('"', "")
-                    for p in response.css(".content.post-content p::text").getall()
-                    if p.strip()
-                ]
-            )
-
-            item = {
-                "title": title,
-                "date": date,
-                "content": content,
-                "url": response.url,
-                "source": "danas.rs",
-            }
-
-            logger.info(f"Successfully parsed article: {title}")
-            return item
-
-        except Exception as e:
-            logger.error(f"Error parsing article {response.url}: {str(e)}")
-            return None
-
     def closed(self, reason):
         """Log when spider is closed."""
         logger.info(f"Spider closed: {reason}")
@@ -337,6 +317,16 @@ class DanasSpider(CrawlSpider):
 def main():
     """Run the spider."""
     try:
+        # Add argument parsing
+        parser = argparse.ArgumentParser(description="Run the Danas spider")
+        parser.add_argument(
+            "--embeddings",
+            action="store_true",
+            default=False,
+            help="Enable embeddings generation (default: False)",
+        )
+        args = parser.parse_args()
+
         # Verify environment variables
         required_vars = ["MONGODB_URI", "DB_NAME", "COLLECTION_NAME"]
         missing_vars = [var for var in required_vars if not os.getenv(var)]
@@ -349,10 +339,13 @@ def main():
             {
                 "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "LOG_LEVEL": "INFO",
+                "ENABLE_EMBEDDINGS": args.embeddings,  # Pass the embeddings flag to the settings
             }
         )
 
-        logger.info("Starting spider...")
+        logger.info(
+            f"Starting spider with embeddings {'enabled' if args.embeddings else 'disabled'}..."
+        )
         process.crawl(DanasSpider)
         process.start()
 
