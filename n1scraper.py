@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 import logging
 import pymongo
 from pymongo import MongoClient
-from sentence_transformers import SentenceTransformer
 import argparse
 
 # Load environment variables
@@ -188,11 +187,22 @@ class MongoDBHandler:
         self.collection = None
         self.enable_embeddings = enable_embeddings
 
-        # Only initialize the model if embeddings are enabled
+        # Only import and initialize the model if embeddings are enabled
         global model
-        if self.enable_embeddings and model is None:
-            model = SentenceTransformer("djovak/embedic-large")
-            logger.info("Initialized embedding model")
+        if self.enable_embeddings:
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                model = SentenceTransformer("djovak/embedic-large")
+                logger.info("Initialized embedding model")
+            except ImportError:
+                logger.error(
+                    "Failed to import SentenceTransformer. Is the package installed?"
+                )
+                raise
+            except Exception as e:
+                logger.error(f"Error initializing model: {str(e)}")
+                raise
 
     def connect(self):
         try:
