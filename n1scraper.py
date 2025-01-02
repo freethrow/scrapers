@@ -11,7 +11,8 @@ from dotenv import load_dotenv
 import logging
 import pymongo
 from pymongo import MongoClient
-import argparse
+import psutil
+import humanize
 
 # Load environment variables
 load_dotenv()
@@ -22,8 +23,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Model will be initialized only if embeddings are enabled
-model = None
+
+class MemoryMonitor:
+    """Monitor memory usage of the script."""
+
+    def __init__(self):
+        self.process = psutil.Process(os.getpid())
+        self.start_time = datetime.now()
+        self.start_memory = self.get_memory_usage()
+        self.peak_memory = self.start_memory
+        self.measurements = []
+
+    def get_memory_usage(self):
+        """Get current memory usage in bytes."""
+        return self.process.memory_info().rss
+
+    def measure(self, checkpoint_name):
+        """Record memory usage at a specific checkpoint."""
+        current_memory = self.get_memory_usage()
+        self.peak_memory = max(self.peak_memory, current_memory)
+
+        measurement = {
+            "checkpoint": checkpoint_name,
+            "timestamp": datetime.now(),
+            "memory_usage": current_memory,
+            "memory_increase": current_memory - self.start_memory,
+        }
+        self.measurements.append(measurement)
+
+        # Log the measurement
+        logger.info(
+            f"Memory at {checkpoint_name}: "
+            f"{humanize.naturalsize(current_memory)} "
+            f"(Δ: {humanize.naturalsize(measurement['memory_increase'])})"
+        )
+
+    def summary(self):
+        """Generate a summary of memory usage."""
+        end_time = datetime.now()
+        duration = end_time - self.start_time
+
+        summary = (
+            f"\nMemory Usage Summary:\n"
+            f"Duration: {duration}\n"
+            f"Initial Memory: {humanize.naturalsize(self.start_memory)}\n"
+            f"Peak Memory: {humanize.naturalsize(self.peak_memory)}\n"
+            f"Peak Memory Increase: {humanize.naturalsize(self.peak_memory - self.start_memory)}\n"
+            f"\nCheckpoint Details:"
+        )
+
+        for m in self.measurements:
+            summary += f"\n{m['checkpoint']}:\n"
+            summary += f"  Usage: {humanize.naturalsize(m['memory_usage'])}\n"
+            summary += f"  Increase: {humanize.naturalsize(m['memory_increase'])}\n"
+
+        logger.info(summary)
 
 
 def get_random_headers():
@@ -106,9 +160,7 @@ def clean_text(text):
 
 
 def extract_entry_content(url):
-    """
-    Extract content from a div with class 'entry-content' using BeautifulSoup with UTF-8 encoding.
-    """
+    """Extract content from a div with class 'entry-content' using BeautifulSoup with UTF-8 encoding."""
     try:
         # Fetch the webpage with explicit encoding
         headers = {
@@ -178,31 +230,13 @@ def extract_entry_content(url):
 
 
 class MongoDBHandler:
-    def __init__(self, enable_embeddings=False):
+    def __init__(self):
         self.mongo_uri = os.getenv("MONGODB_URI")
         self.db_name = os.getenv("DB_NAME")
-        self.collection_name = os.getenv("COLLECTION_NAME")
+        self.collection_name = os.getenv("COLLECTION_SRB")
         self.client = None
         self.db = None
         self.collection = None
-        self.enable_embeddings = enable_embeddings
-
-        # Only import and initialize the model if embeddings are enabled
-        global model
-        if self.enable_embeddings:
-            try:
-                from sentence_transformers import SentenceTransformer
-
-                model = SentenceTransformer("djovak/embedic-large")
-                logger.info("Initialized embedding model")
-            except ImportError:
-                logger.error(
-                    "Failed to import SentenceTransformer. Is the package installed?"
-                )
-                raise
-            except Exception as e:
-                logger.error(f"Error initializing model: {str(e)}")
-                raise
 
     def connect(self):
         try:
@@ -242,19 +276,6 @@ class MongoDBHandler:
             # Add timestamp
             article["scraped_at"] = datetime.utcnow()
 
-            # Generate embedding only if enabled and model is loaded
-            if self.enable_embeddings and model is not None:
-                try:
-                    text_for_embedding = f"{article['title']} {article['content']}"
-                    embedding = model.encode(text_for_embedding)
-                    article["embedding"] = embedding.tolist()
-                    logger.info(f"Generated embedding for article: {article['title']}")
-                except Exception as e:
-                    logger.error(f"Error generating embedding: {str(e)}")
-                    article["embedding"] = None
-            else:
-                article["embedding"] = None
-
             # Save to MongoDB
             self.collection.insert_one(article)
             logger.info(f"Successfully saved article: {article['title']}")
@@ -275,40 +296,34 @@ class MongoDBHandler:
 
 def main():
     try:
-        # Add argument parsing
-        parser = argparse.ArgumentParser(description="Run the N1 scraper")
-        parser.add_argument(
-            "--embeddings",
-            action="store_true",
-            default=False,
-            help="Enable embeddings generation (default: False)",
-        )
-        args = parser.parse_args()
+        # Initialize memory monitor
+        memory_monitor = MemoryMonitor()
+        memory_monitor.measure("Script Start")
 
         # Verify environment variables
-        required_vars = ["MONGODB_URI", "DB_NAME", "COLLECTION_NAME"]
+        required_vars = ["MONGODB_URI", "DB_NAME", "COLLECTION_SRB"]
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
             raise ValueError(
                 f"Missing required environment variables: {', '.join(missing_vars)}"
             )
 
-        # Initialize MongoDB with embeddings flag
-        mongodb = MongoDBHandler(enable_embeddings=args.embeddings)
+        # Initialize MongoDB
+        mongodb = MongoDBHandler()
         mongodb.connect()
+        memory_monitor.measure("MongoDB Connection")
 
-        logger.info(
-            f"Starting scraper with embeddings {'enabled' if args.embeddings else 'disabled'}..."
-        )
+        logger.info("Starting scraper...")
 
         # Process pages one by one
         page = 1
-        max_pages = 50  # You can adjust this limit
+        max_pages = 10  # You can adjust this limit
 
         while page <= max_pages:
             try:
                 logger.info(f"Starting to process page {page}")
                 articles_found = process_page(page, mongodb)
+                memory_monitor.measure(f"After Page {page}")
 
                 # If no articles found on the page, we might have reached the end
                 if not articles_found:
@@ -323,6 +338,11 @@ def main():
 
         # Cleanup
         mongodb.close()
+        memory_monitor.measure("After MongoDB Close")
+
+        # Generate memory usage summary
+        memory_monitor.summary()
+
         logger.info("Scraping completed successfully")
 
     except Exception as e:
